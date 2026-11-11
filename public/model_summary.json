@@ -1,0 +1,9 @@
+{
+  "model_name": "Trashformer-42M",
+  "tagline": "The best trash talking LLM running right in your phone. Offline.",
+  "parameters": 42916224,
+  "training_tokens": 3000000000,
+  "hardware": "NVIDIA H200 SXM (141GB HBM3e)",
+  "throughput": "1.39M tokens/sec",
+  "architecture": "Decoder-Only Transformer (FlashSelfAttention + RoPE + RMSNorm + SwiGLU)"
+}
