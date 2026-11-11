@@ -1,6 +1,7 @@
 /**
  * In-browser execution engine for Trashformer-42M using ONNX Runtime Web
  * Supports Full Precision (FP32) and Quantized (INT8) models with live streaming
+ * Includes browser CacheStorage for instant zero-download reloads and automatic CDN fallback
  */
 
 import * as ort from 'onnxruntime-web';
@@ -22,6 +23,68 @@ const IM_START_ID = 50257;
 const IM_END_ID = 50258;
 const EOT_ID = 50256;
 
+const CACHE_NAME = 'trashformer-model-cache-v1';
+
+/**
+ * Check if the given buffer is a Git LFS pointer, HTML fallback, or corrupt data
+ */
+function isInvalidModelBuffer(uint8Array) {
+  if (!uint8Array || uint8Array.length < 10000000) {
+    // Valid Trashformer ONNX models are > 60MB. Under 10MB is guaranteed to be an LFS pointer or error page.
+    return true;
+  }
+  const header = String.fromCharCode(...uint8Array.subarray(0, Math.min(40, uint8Array.length)));
+  if (
+    header.includes('version https://') || 
+    header.includes('<!DOCTYPE') || 
+    header.includes('<html') || 
+    header.trim().startsWith('{')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Retrieve cached ONNX model weights from browser CacheStorage
+ */
+async function getCachedModel(cacheKey) {
+  try {
+    if (typeof caches === 'undefined') return null;
+    const cache = await caches.open(CACHE_NAME);
+    const cachedResponse = await cache.match(cacheKey);
+    if (cachedResponse) {
+      const buffer = await cachedResponse.arrayBuffer();
+      const uint8 = new Uint8Array(buffer);
+      if (!isInvalidModelBuffer(uint8)) {
+        return uint8;
+      }
+    }
+  } catch (e) {
+    console.warn('CacheStorage read failed:', e);
+  }
+  return null;
+}
+
+/**
+ * Store ONNX model weights in browser CacheStorage for instant future loads
+ */
+async function putCachedModel(cacheKey, uint8Array) {
+  try {
+    if (typeof caches === 'undefined') return;
+    const cache = await caches.open(CACHE_NAME);
+    const response = new Response(uint8Array, {
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(uint8Array.byteLength)
+      }
+    });
+    await cache.put(cacheKey, response);
+  } catch (e) {
+    console.warn('CacheStorage write failed:', e);
+  }
+}
+
 export class TrashformerEngine {
   constructor() {
     this.session = null;
@@ -33,6 +96,41 @@ export class TrashformerEngine {
     this.cachedModels = {}; // modelPath -> Uint8Array
   }
 
+  async downloadModelBytes(url, label, defaultSize, onProgress) {
+    const res = await fetch(url);
+    if (!res.ok) {
+      throw new Error(`Failed to download weights from ${url}: HTTP ${res.status}`);
+    }
+
+    const contentLength = res.headers.get('content-length');
+    const totalBytes = contentLength ? parseInt(contentLength, 10) : defaultSize;
+    const reader = res.body.getReader();
+    let receivedBytes = 0;
+    const chunks = [];
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      receivedBytes += value.length;
+      const pct = Math.min(100, Math.round((receivedBytes / totalBytes) * 100));
+      const mbReceived = (receivedBytes / (1024 * 1024)).toFixed(1);
+      const mbTotal = (totalBytes / (1024 * 1024)).toFixed(1);
+      onProgress({
+        stage: 'download',
+        message: `Downloading ${label}: ${mbReceived}MB / ${mbTotal}MB (${pct}%)`
+      });
+    }
+
+    const modelData = new Uint8Array(receivedBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      modelData.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return modelData;
+  }
+
   async init(onProgress = () => {}, preferredBackend = 'wasm', precision = 'fp32') {
     const modelPath = precision === 'int8' ? '/model_int8.onnx' : '/model.onnx';
     const isPrecisionChanged = this.activePrecision !== (precision === 'int8' ? 'INT8 (Quantized)' : 'FP32 (Full Precision)');
@@ -41,13 +139,21 @@ export class TrashformerEngine {
 
     if (!this.tokenizer) {
       onProgress({ stage: 'tokenizer', message: 'Loading BPE Tokenizer dictionary...' });
-      const [vocabRes, mergesRes] = await Promise.all([
-        fetch('/vocab.json'),
-        fetch('/merges.json')
+      let [vocabRes, mergesRes] = await Promise.all([
+        fetch('/vocab.json').catch(() => null),
+        fetch('/merges.json').catch(() => null)
       ]);
 
-      if (!vocabRes.ok || !mergesRes.ok) {
-        throw new Error(`Failed to load tokenizer files: ${vocabRes.status} / ${mergesRes.status}`);
+      if (!vocabRes || !vocabRes.ok || !mergesRes || !mergesRes.ok) {
+        // Fallback to Hugging Face Hub
+        [vocabRes, mergesRes] = await Promise.all([
+          fetch('https://huggingface.co/NihalGazi/Trashformer-42M/raw/main/vocab.json'),
+          fetch('https://huggingface.co/NihalGazi/Trashformer-42M/raw/main/merges.json')
+        ]);
+      }
+
+      if (!vocabRes || !vocabRes.ok || !mergesRes || !mergesRes.ok) {
+        throw new Error(`Failed to load tokenizer files: ${vocabRes?.status} / ${mergesRes?.status}`);
       }
 
       const vocab = await vocabRes.json();
@@ -57,46 +163,55 @@ export class TrashformerEngine {
 
     if (!this.cachedModels[modelPath]) {
       const isFP32 = precision !== 'int8';
-      const label = isFP32 ? 'Full Precision FP32 (250MB)' : 'INT8 Quantized (63MB)';
-      onProgress({ stage: 'model', message: `Downloading Trashformer-42M ${label}...` });
+      const label = isFP32 ? 'Full Precision FP32 (238MB)' : 'INT8 Quantized (61MB)';
+      const defaultSize = isFP32 ? 250140785 : 63600437;
+      const cacheKey = `/trashformer-weights-${precision}.onnx`;
+      const hfFileName = precision === 'int8' ? 'model_quantized.onnx' : 'model.onnx';
+      const hfUrl = `https://huggingface.co/NihalGazi/Trashformer-42M/resolve/main/${hfFileName}`;
 
-      // Try local /public first, then gracefully fallback to official Hugging Face Hub CDN
-      let modelRes = await fetch(modelPath).catch(() => null);
-      if (!modelRes || !modelRes.ok) {
-        const hfFileName = precision === 'int8' ? 'model_quantized.onnx' : 'model.onnx';
-        const hfUrl = `https://huggingface.co/NihalGazi/Trashformer-42M/resolve/main/${hfFileName}`;
-        onProgress({ stage: 'download', message: `Fetching weights from Hugging Face Hub (${label})...` });
-        modelRes = await fetch(hfUrl);
-        if (!modelRes.ok) {
-          throw new Error(`Failed to download weights from local and Hugging Face: HTTP ${modelRes.status}`);
+      // 1. Check browser CacheStorage for instant reload
+      const cached = await getCachedModel(cacheKey);
+      if (cached) {
+        onProgress({ stage: 'cache', message: `Loaded ${label} from local browser cache!` });
+        this.cachedModels[modelPath] = cached;
+      } else {
+        onProgress({ stage: 'model', message: `Preparing Trashformer-42M ${label}...` });
+
+        const isLocalhost = typeof window !== 'undefined' && 
+          (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
+        let modelData = null;
+
+        // 2. If running locally on localhost, attempt to read local public file if it's not an LFS pointer
+        if (isLocalhost) {
+          try {
+            const check = await fetch(modelPath, { method: 'HEAD' });
+            const cl = parseInt(check.headers.get('content-length') || '0', 10);
+            if (check.ok && cl > 10000000) {
+              const data = await this.downloadModelBytes(modelPath, `${label} (Local)`, defaultSize, onProgress);
+              if (!isInvalidModelBuffer(data)) {
+                modelData = data;
+              }
+            }
+          } catch (e) {
+            console.warn('Local model fetch skipped/failed:', e);
+          }
         }
-      }
 
-      const contentLength = modelRes.headers.get('content-length');
-      const totalBytes = contentLength ? parseInt(contentLength, 10) : (isFP32 ? 250140785 : 63600437);
-      const reader = modelRes.body.getReader();
-      let receivedBytes = 0;
-      const chunks = [];
+        // 3. Deployed on Vercel/production or Git LFS pointer detected: download from Hugging Face Hub CDN
+        if (!modelData) {
+          onProgress({ stage: 'download', message: `Fetching weights from Hugging Face Hub CDN (${label})...` });
+          modelData = await this.downloadModelBytes(hfUrl, `${label} (Hugging Face CDN)`, defaultSize, onProgress);
+          
+          if (isInvalidModelBuffer(modelData)) {
+            throw new Error('Downloaded model data is invalid (detected Git LFS text pointer).');
+          }
+        }
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        receivedBytes += value.length;
-        const pct = Math.min(100, Math.round((receivedBytes / totalBytes) * 100));
-        onProgress({
-          stage: 'download',
-          message: `Downloading ${label}: ${(receivedBytes / (1024 * 1024)).toFixed(1)}MB / ${(totalBytes / (1024 * 1024)).toFixed(1)}MB (${pct}%)`
-        });
+        // 4. Save to CacheStorage for instant future page loads
+        await putCachedModel(cacheKey, modelData);
+        this.cachedModels[modelPath] = modelData;
       }
-
-      const modelData = new Uint8Array(receivedBytes);
-      let offset = 0;
-      for (const chunk of chunks) {
-        modelData.set(chunk, offset);
-        offset += chunk.length;
-      }
-      this.cachedModels[modelPath] = modelData;
     }
 
     onProgress({ stage: 'compile', message: 'Initializing execution context...' });
@@ -312,7 +427,7 @@ export class TrashformerEngine {
         elapsed: elapsed.toFixed(2)
       });
 
-      // CRITICAL: Yield to the browser's render loop so the token repaints to screen immediately!
+      // Yield to the browser's render loop so the token repaints to screen immediately
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
 

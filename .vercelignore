@@ -1,0 +1,3 @@
+# Ignore large binary ONNX models on Vercel (weights are fetched directly from Hugging Face Hub CDN)
+public/*.onnx
+dist/*.onnx
