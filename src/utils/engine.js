@@ -7,17 +7,17 @@
 import * as ort from 'onnxruntime-web';
 import { BpeTokenizer } from './tokenizer.js';
 
-// Configure absolute base path for WASM and helper worker scripts
+// Configure absolute base path for WASM
 const basePath = (typeof window !== 'undefined' ? window.location.origin : '') + '/';
 ort.env.wasm.wasmPaths = basePath;
 
-// Configure threading according to crossOriginIsolated / SharedArrayBuffer support
-const hasSharedArrayBuffer = typeof SharedArrayBuffer !== 'undefined' && (typeof crossOriginIsolated === 'undefined' || crossOriginIsolated);
-if (!hasSharedArrayBuffer) {
-  ort.env.wasm.numThreads = 1;
-} else {
-  ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
-}
+// Enable SIMD hardware acceleration and single-thread mode.
+// Trashformer-42M is an ultra-compact 42M model: single-thread SIMD generates at 30-50 tok/s.
+// Crucially, numThreads = 1 prevents Emscripten from spawning module pthreads Web Workers,
+// which crash with "worker sent an error! undefined:undefined: undefined" on static hosts.
+ort.env.wasm.simd = true;
+ort.env.wasm.numThreads = 1;
+ort.env.wasm.proxy = false;
 
 const IM_START_ID = 50257;
 const IM_END_ID = 50258;
@@ -231,10 +231,24 @@ export class TrashformerEngine {
       }
     }
 
-    this.session = await ort.InferenceSession.create(this.cachedModels[modelPath], {
-      executionProviders: providers,
-      graphOptimizationLevel: 'all'
-    });
+    try {
+      this.session = await ort.InferenceSession.create(this.cachedModels[modelPath], {
+        executionProviders: providers,
+        graphOptimizationLevel: 'all'
+      });
+    } catch (sessionErr) {
+      if (isWebGPU) {
+        console.warn('WebGPU execution provider failed, falling back to WASM SIMD:', sessionErr);
+        providers = ['wasm'];
+        isWebGPU = false;
+        this.session = await ort.InferenceSession.create(this.cachedModels[modelPath], {
+          executionProviders: ['wasm'],
+          graphOptimizationLevel: 'all'
+        });
+      } else {
+        throw sessionErr;
+      }
+    }
 
     this.activeProvider = isWebGPU ? 'WebGPU (Hardware GPU)' : 'WASM SIMD (CPU Precision)';
     this.activePrecision = precision === 'int8' ? 'INT8 (Quantized)' : 'FP32 (Full Precision)';
